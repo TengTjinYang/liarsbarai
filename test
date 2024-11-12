@@ -1,0 +1,236 @@
+import numpy as np
+from collections import defaultdict
+import random
+
+class LiarsBarDeckState:
+    def __init__(self, num_players=4):
+        self.num_players = num_players
+        self.reset()
+    
+    def reset(self):
+        self.liars_card = random.choice(['A', 'K', 'Q'])  # Random target card for the round
+        # Initialize deck with specific card distribution
+        self.deck = (
+            ['A'] * (6 if self.liars_card != 'A' else 5) +  # 6 or 5 Aces
+            ['K'] * (6 if self.liars_card != 'K' else 5) +  # 6 or 5 Kings
+            ['Q'] * (6 if self.liars_card != 'Q' else 5) +  # 6 or 5 Queens
+            ['J'] * 2 +    # 2 Jokers
+            ['D']          # Devil Card (replaces one of the liar's cards)
+        )
+        random.shuffle(self.deck)
+        
+        # Deal 5 cards to each player
+        self.hands = [[] for _ in range(self.num_players)]
+        for i in range(self.num_players * 5):
+            self.hands[i % self.num_players].append(self.deck.pop())
+        
+        # Initialize revolvers (0 means empty, 1 means bullet)
+        self.revolvers = []
+        for _ in range(self.num_players):
+            chamber = [0] * 6
+            chamber[random.randint(0, 5)] = 1  # Place bullet randomly
+            self.revolvers.append(chamber)
+        
+        self.revolver_positions = [0] * self.num_players  # Current chamber position
+        self.players_alive = [True] * self.num_players
+        self.current_player = 0
+        self.last_play = None
+        self.played_pile = []
+        self.game_over = False
+        
+        return self.get_observation()
+    
+    def get_observation(self):
+        return {
+            'own_hand': self.hands[self.current_player],
+            'own_revolver': self.revolvers[self.current_player],
+            'revolver_position': self.revolver_positions[self.current_player],
+            'last_play': self.last_play,
+            'liars_card': self.liars_card,
+            'players_alive': self.players_alive,
+            'num_cards_per_player': [len(hand) for hand in self.hands]
+        }
+    
+    def death_roulette(self, player_index):
+        """Execute death roulette for a player. Returns True if player dies."""
+        current_chamber = self.revolver_positions[player_index]
+        result = self.revolvers[player_index][current_chamber] == 1
+        
+        # Rotate chamber
+        self.revolver_positions[player_index] = (current_chamber + 1) % 6
+        
+        if result:
+            self.players_alive[player_index] = False
+        return result
+    
+    def verify_play(self, cards_played, claimed_count):
+        """Verify if the played cards match the claim"""
+        valid_cards = 0
+        for card in cards_played:
+            if card == self.liars_card or card == 'J':  # Count target cards and Jokers
+                valid_cards += 1
+        return valid_cards >= claimed_count
+    
+    def step(self, action):
+        reward = 0
+        done = False
+        
+        if action == 'challenge':
+            # Verify last play
+            success = not self.verify_play(self.played_pile[-self.last_play[0]:], self.last_play[0])
+            target_player = (self.current_player - 1) % self.num_players
+            
+            if success:
+                # Challenge successful, previous player faces death roulette
+                if self.death_roulette(target_player):
+                    reward = 50  # Reward for successful challenge leading to elimination
+            else:
+                # Challenge failed, current player faces death roulette
+                if self.death_roulette(self.current_player):
+                    reward = -100  # Penalty for failed challenge leading to self-elimination
+            
+            # Check for devil card revelation
+            if 'D' in self.played_pile[-self.last_play[0]:]:
+                # All other players face retribution
+                for i in range(self.num_players):
+                    if i != target_player and self.players_alive[i]:
+                        if self.death_roulette(i):
+                            reward += 30  # Reward for surviving devil card revelation
+            
+            # Start new round
+            self.played_pile = []
+            self.last_play = None
+            self.liars_card = random.choice(['A', 'K', 'Q'])
+            
+        else:
+            # Playing cards
+            num_cards, cards_to_play = action
+            
+            # Remove played cards from hand
+            for card in cards_to_play:
+                self.hands[self.current_player].remove(card)
+            
+            self.played_pile.extend(cards_to_play)
+            self.last_play = (num_cards, self.liars_card)
+            
+            # Reward for successfully playing cards
+            reward = 10
+            
+            # Additional reward for playing devil card
+            if 'D' in cards_to_play:
+                reward += 20
+        
+        # Check game end conditions
+        alive_count = sum(self.players_alive)
+        if alive_count == 1:
+            done = True
+            if self.players_alive[self.current_player]:
+                reward += 200  # Big reward for winning the game
+        
+        # Move to next alive player
+        self.current_player = (self.current_player + 1) % self.num_players
+        while not self.players_alive[self.current_player]:
+            self.current_player = (self.current_player + 1) % self.num_players
+        
+        return self.get_observation(), reward, done
+
+class LiarsBarDeckAI:
+    def __init__(self, learning_rate=0.1, discount_factor=0.95):
+        self.q_table = defaultdict(lambda: defaultdict(float))
+        self.lr = learning_rate
+        self.gamma = discount_factor
+    
+    def get_state_key(self, observation):
+        return (
+            tuple(sorted(observation['own_hand'])),
+            tuple(observation['own_revolver']),
+            observation['revolver_position'],
+            str(observation['last_play']),
+            observation['liars_card'],
+            tuple(observation['players_alive']),
+            tuple(observation['num_cards_per_player'])
+        )
+    
+    def get_valid_actions(self, observation):
+        actions = []
+        
+        # Can challenge if there's a last play
+        if observation['last_play'] is not None:
+            actions.append('challenge')
+        
+        # Playing cards
+        hand = observation['own_hand']
+        target_card = observation['liars_card']
+        
+        # Check if hand contains devil card
+        if 'D' in hand:
+            # Devil card must be played alone
+            actions.append((1, ['D']))
+        else:
+            # Generate all valid card combinations (1-3 cards)
+            for num_cards in range(1, 4):
+                if observation['last_play'] is None or num_cards >= observation['last_play'][0]:
+                    # Find all possible combinations of cards that could represent target card
+                    valid_cards = [c for c in hand if c == target_card or c == 'J']
+                    for combo in self._get_combinations(valid_cards, num_cards):
+                        actions.append((num_cards, list(combo)))
+        
+        return actions
+    
+    def _get_combinations(self, cards, size):
+        """Helper function to generate card combinations"""
+        if size == 0:
+            yield []
+            return
+        if not cards:
+            return
+        first = cards[0]
+        rest = cards[1:]
+        for combo in self._get_combinations(rest, size - 1):
+            yield [first] + combo
+        yield from self._get_combinations(rest, size)
+    
+    def choose_action(self, observation, epsilon=0.1):
+        state = self.get_state_key(observation)
+        valid_actions = self.get_valid_actions(observation)
+        
+        # Epsilon-greedy action selection
+        if random.random() < epsilon:
+            return random.choice(valid_actions)
+        
+        # Choose action with highest Q-value
+        q_values = {str(action): self.q_table[state][str(action)] for action in valid_actions}
+        return eval(max(q_values.items(), key=lambda x: x[1])[0])
+    
+    def update(self, state, action, reward, next_state):
+        state_key = self.get_state_key(state)
+        next_state_key = self.get_state_key(next_state)
+        
+        # Q-learning update
+        next_actions = self.get_valid_actions(next_state)
+        if next_actions:
+            next_max = max([self.q_table[next_state_key][str(a)] for a in next_actions])
+        else:
+            next_max = 0
+            
+        current_q = self.q_table[state_key][str(action)]
+        self.q_table[state_key][str(action)] = current_q + self.lr * (reward + self.gamma * next_max - current_q)
+
+def train_model(episodes=10000):
+    env = LiarsBarDeckState()
+    agent = LiarsBarDeckAI()
+    
+    for episode in range(episodes):
+        state = env.reset()
+        done = False
+        
+        while not done:
+            action = agent.choose_action(state)
+            next_state, reward, done = env.step(action)
+            agent.update(state, action, reward, next_state)
+            state = next_state
+            
+        if episode % 1000 == 0:
+            print(f"Episode {episode} completed")
+    
+    return agent
